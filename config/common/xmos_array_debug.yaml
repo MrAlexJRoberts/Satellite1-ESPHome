@@ -1,0 +1,142 @@
+# Development package for the experimental four-microphone XMOS firmware
+# (satellite1_firmware_fixed_delay_4mic / _4mic_bf). Not for production builds.
+#
+# Reads the XMOS array diagnostics resource (233) over the existing SPI
+# device-control link every 2 s and publishes it as diagnostic entities. With a
+# dev-tap XMOS build (SAT1_ARRAY_DEV_TAP=ON) it also lets you route raw, AEC or
+# beam signals onto the two audio lanes for capture.
+#
+# Enable by adding to the packages of your device YAML:
+#   packages:
+#     xmos_array_debug: !include common/xmos_array_debug.yaml
+# (paths relative to the config/ directory, like the other packages; the
+# "includes:" path below is resolved relative to your device YAML's directory).
+#
+# Written for Satellite1-ESPHome v0.2.1-beta.0 (9a58961): see the notes at the
+# top of xmos_array_diag.h on how transfer() returns read data in that tree.
+#
+# On a firmware without resource 233 (production 2-mic build) every poll fails
+# quietly and the entities stay unavailable.
+
+esphome:
+  includes:
+    - common/xmos_array_diag.h
+
+sensor:
+  - { platform: template, id: xa_selected, name: "XMOS array selected pair/beam", accuracy_decimals: 0, entity_category: diagnostic, update_interval: never }
+  - { platform: template, id: xa_switches, name: "XMOS array switch count", accuracy_decimals: 0, state_class: total_increasing, entity_category: diagnostic, update_interval: never }
+  - { platform: template, id: xa_vnr, name: "XMOS array VNR", accuracy_decimals: 2, entity_category: diagnostic, update_interval: never }
+  - { platform: template, id: xa_raw_e, name: "XMOS mic E raw RMS", unit_of_measurement: dBFS, accuracy_decimals: 1, entity_category: diagnostic, update_interval: never }
+  - { platform: template, id: xa_raw_w, name: "XMOS mic W raw RMS", unit_of_measurement: dBFS, accuracy_decimals: 1, entity_category: diagnostic, update_interval: never }
+  - { platform: template, id: xa_raw_n, name: "XMOS mic N raw RMS", unit_of_measurement: dBFS, accuracy_decimals: 1, entity_category: diagnostic, update_interval: never }
+  - { platform: template, id: xa_raw_s, name: "XMOS mic S raw RMS", unit_of_measurement: dBFS, accuracy_decimals: 1, entity_category: diagnostic, update_interval: never }
+  - { platform: template, id: xa_peak_max, name: "XMOS mic peak (max of 4)", unit_of_measurement: dBFS, accuracy_decimals: 1, entity_category: diagnostic, update_interval: never }
+  - { platform: template, id: xa_clips, name: "XMOS mic clipped samples", accuracy_decimals: 0, state_class: total_increasing, entity_category: diagnostic, update_interval: never }
+  - { platform: template, id: xa_aec_e, name: "XMOS mic E AEC RMS", unit_of_measurement: dBFS, accuracy_decimals: 1, entity_category: diagnostic, update_interval: never }
+  - { platform: template, id: xa_aec_w, name: "XMOS mic W AEC RMS", unit_of_measurement: dBFS, accuracy_decimals: 1, entity_category: diagnostic, update_interval: never }
+  - { platform: template, id: xa_aec_n, name: "XMOS mic N AEC RMS", unit_of_measurement: dBFS, accuracy_decimals: 1, entity_category: diagnostic, update_interval: never }
+  - { platform: template, id: xa_aec_s, name: "XMOS mic S AEC RMS", unit_of_measurement: dBFS, accuracy_decimals: 1, entity_category: diagnostic, update_interval: never }
+  - { platform: template, id: xa_erle_min, name: "XMOS AEC ERLE (min of 4, ref active)", unit_of_measurement: dB, accuracy_decimals: 1, entity_category: diagnostic, update_interval: never }
+  - { platform: template, id: xa_out_rms, name: "XMOS output RMS", unit_of_measurement: dBFS, accuracy_decimals: 1, entity_category: diagnostic, update_interval: never }
+  - { platform: template, id: xa_aec_ms_avg, name: "XMOS AEC stage avg", unit_of_measurement: ms, accuracy_decimals: 2, entity_category: diagnostic, update_interval: never }
+  - { platform: template, id: xa_aec_ms_max, name: "XMOS AEC stage max", unit_of_measurement: ms, accuracy_decimals: 2, entity_category: diagnostic, update_interval: never }
+  - { platform: template, id: xa_fe_ms_avg, name: "XMOS front end+IC stage avg", unit_of_measurement: ms, accuracy_decimals: 2, entity_category: diagnostic, update_interval: never }
+  - { platform: template, id: xa_fe_ms_max, name: "XMOS front end+IC stage max", unit_of_measurement: ms, accuracy_decimals: 2, entity_category: diagnostic, update_interval: never }
+  - { platform: template, id: xa_deadline_misses, name: "XMOS stage deadline misses", accuracy_decimals: 0, state_class: total_increasing, entity_category: diagnostic, update_interval: never }
+  - { platform: template, id: xa_dropped, name: "XMOS mic frames dropped (est.)", accuracy_decimals: 0, state_class: total_increasing, entity_category: diagnostic, update_interval: never }
+  - { platform: template, id: xa_late_ms, name: "XMOS mic input lateness max", unit_of_measurement: ms, accuracy_decimals: 2, entity_category: diagnostic, update_interval: never }
+  - { platform: template, id: xa_heap_t0, name: "XMOS tile 0 heap min free", unit_of_measurement: B, accuracy_decimals: 0, entity_category: diagnostic, update_interval: never }
+  - { platform: template, id: xa_heap_t1, name: "XMOS tile 1 heap min free", unit_of_measurement: B, accuracy_decimals: 0, entity_category: diagnostic, update_interval: never }
+
+interval:
+  - interval: 2s
+    then:
+      - lambda: |-
+          if (id(satellite1_id).state != satellite1::SAT_XMOS_CONNECTED_STATE) {
+            return;
+          }
+          xmos_array_diag_status_t st{};
+          if (xmos_array_read(id(satellite1_id), XMOS_ARRAY_DIAG_CMD_GET_STATUS, &st) != 0) {
+            return;
+          }
+          if (!xmos_array_status_valid(st)) {
+            ESP_LOGW("xmos_array", "unexpected diagnostics frame (version %u, mode %u)", st.version, st.frontend_mode);
+            return;
+          }
+          auto cdb = [](int16_t v) { return v / 100.0f; };
+          id(xa_selected).publish_state(st.selected);
+          id(xa_switches).publish_state(st.switch_count);
+          id(xa_vnr).publish_state(st.vnr_x10000 / 10000.0f);
+          id(xa_raw_e).publish_state(cdb(st.raw_rms_cdb[0]));
+          id(xa_raw_w).publish_state(cdb(st.raw_rms_cdb[1]));
+          id(xa_raw_n).publish_state(cdb(st.raw_rms_cdb[2]));
+          id(xa_raw_s).publish_state(cdb(st.raw_rms_cdb[3]));
+          id(xa_aec_e).publish_state(cdb(st.aec_rms_cdb[0]));
+          id(xa_aec_w).publish_state(cdb(st.aec_rms_cdb[1]));
+          id(xa_aec_n).publish_state(cdb(st.aec_rms_cdb[2]));
+          id(xa_aec_s).publish_state(cdb(st.aec_rms_cdb[3]));
+          int16_t peak = st.raw_peak_cdb[0];
+          uint32_t clips = 0;
+          int16_t erle = st.aec_erle_cdb[0];
+          for (int i = 0; i < 4; i++) {
+            const int16_t pk_i = st.raw_peak_cdb[i];
+            const int16_t erle_i = st.aec_erle_cdb[i];
+            if (pk_i > peak) peak = pk_i;
+            if (erle_i < erle) erle = erle_i;
+            clips += st.raw_clip_count[i];
+          }
+          id(xa_peak_max).publish_state(cdb(peak));
+          id(xa_clips).publish_state(clips);
+          if (st.ref_active) {
+            id(xa_erle_min).publish_state(cdb(erle));
+          }
+          id(xa_out_rms).publish_state(cdb(st.output_rms_cdb));
+          id(xa_aec_ms_avg).publish_state(st.t1_aec_ticks_avg / XMOS_REF_TICKS_PER_MS);
+          id(xa_aec_ms_max).publish_state(st.t1_aec_ticks_max / XMOS_REF_TICKS_PER_MS);
+          id(xa_fe_ms_avg).publish_state(st.t0_frontend_ticks_avg / XMOS_REF_TICKS_PER_MS);
+          id(xa_fe_ms_max).publish_state(st.t0_frontend_ticks_max / XMOS_REF_TICKS_PER_MS);
+          id(xa_deadline_misses).publish_state(st.deadline_misses);
+          id(xa_dropped).publish_state(st.t1_dropped_frames_est);
+          id(xa_late_ms).publish_state(st.t1_input_late_ticks_max / XMOS_REF_TICKS_PER_MS);
+          id(xa_heap_t0).publish_state(st.t0_heap_min_free);
+          id(xa_heap_t1).publish_state(st.t1_heap_min_free);
+          ESP_LOGD("xmos_array", "sel=%u sw=%u vnr=%.2f aec=%.2f/%.2fms fe=%.2f/%.2fms miss=%u drop=%u heap=%u/%u",
+                   st.selected, (unsigned) st.switch_count, st.vnr_x10000 / 10000.0f,
+                   st.t1_aec_ticks_avg / XMOS_REF_TICKS_PER_MS, st.t1_aec_ticks_max / XMOS_REF_TICKS_PER_MS,
+                   st.t0_frontend_ticks_avg / XMOS_REF_TICKS_PER_MS, st.t0_frontend_ticks_max / XMOS_REF_TICKS_PER_MS,
+                   (unsigned) st.deadline_misses, (unsigned) st.t1_dropped_frames_est,
+                   (unsigned) st.t0_heap_min_free, (unsigned) st.t1_heap_min_free);
+
+# Development tap: only has an effect on XMOS builds made with
+# -DSAT1_ARRAY_DEV_TAP=ON. Lane 0 is what Assist streams to Home Assistant
+# (and what assist_pipeline debug recordings capture); lane 1 feeds the
+# wake-word engine, so wake words will not work while a tap is active.
+select:
+  - platform: template
+    id: xa_tap_mode
+    name: "XMOS dev tap"
+    entity_category: config
+    optimistic: true
+    options: ["Off", "Raw mics", "AEC outputs", "Front end / final", "Beams"]
+    initial_option: "Off"
+    on_value:
+      - script.execute: xa_send_tap
+
+number:
+  - { platform: template, id: xa_tap_a, name: "XMOS dev tap channel A", entity_category: config, optimistic: true, min_value: 0, max_value: 7, step: 1, initial_value: 0, on_value: { then: [ { script.execute: xa_send_tap } ] } }
+  - { platform: template, id: xa_tap_b, name: "XMOS dev tap channel B", entity_category: config, optimistic: true, min_value: 0, max_value: 7, step: 1, initial_value: 2, on_value: { then: [ { script.execute: xa_send_tap } ] } }
+
+script:
+  - id: xa_send_tap
+    mode: queued
+    then:
+      - lambda: |-
+          auto idx = id(xa_tap_mode).active_index();
+          uint8_t payload[3] = {
+            static_cast<uint8_t>(idx.has_value() ? idx.value() : 0),
+            static_cast<uint8_t>(id(xa_tap_a).state),
+            static_cast<uint8_t>(id(xa_tap_b).state),
+          };
+          if (!id(satellite1_id).transfer(XMOS_ARRAY_DIAG_RESID, XMOS_ARRAY_DIAG_CMD_SET_TAP, payload, sizeof(payload))) {
+            ESP_LOGW("xmos_array", "dev tap write failed (not a dev-tap XMOS build?)");
+          }

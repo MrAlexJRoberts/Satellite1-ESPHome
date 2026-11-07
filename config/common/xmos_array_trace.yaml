@@ -1,0 +1,185 @@
+# Development package: high-resolution trace of the four-mic XMOS beam
+# selector, for controlled direction tests. Not for production builds.
+#
+# Reads the array diagnostics resource (233) every 100 ms and logs one "S" line
+# for every new XMOS snapshot (the XMOS publishes every 16 frames = 240 ms), so
+# no snapshot is skipped. On XMOS firmware with the selector diagnostics patch
+# it also logs an "X" line with the selector internals; older four-mic
+# firmware is detected and probed again once a minute, nothing else changes.
+#
+#   S f=<frames> sel sw best lead(dB, best minus selected, smoothed) vnr ref tap
+#     raw=<4 raw mic RMS> aec=<4 AEC RMS> out=<output RMS> pk=<max raw peak>
+#     miss=<deadline misses> drop=<dropped mic frames est.> gap=<snapshots missed>
+#     mk=<marker> sc=<8 smoothed scores>
+#   X f=<frames> gate ivnr ovnr val=<valid>/<window frames> rl=<max raw lead>@<beam>
+#     ch=<challenger> cc=<confirm count> fss=<frames since switch>
+#     m=<margin> cf=<confirm frames> dw=<dwell frames> rs=<8 raw scores>
+#
+# Use the "XMOS test marker" select in Home Assistant to put position
+# boundaries into the log (a "MARK" line). The tuning controls only work on a
+# dev-tap XMOS build (SAT1_ARRAY_DEV_TAP=ON) with the selector diagnostics
+# patch; the "X" lines show the tuning actually in use.
+#
+# Include next to (or instead of) your existing XMOS telemetry:
+#   packages:
+#     xmos_array_trace: !include common/xmos_array_trace.yaml
+# GET_STATUS clears the XMOS peak holds on every read, so with two pollers each
+# sees shorter peak windows; nothing else interacts. The "includes:" path is
+# resolved relative to your device YAML's directory.
+#
+# Written for Satellite1-ESPHome v0.2.1-beta.0 (9a58961): see the notes at the
+# top of xmos_array_diag.h on how transfer() returns read data in that tree.
+
+esphome:
+  includes:
+    - common/xmos_array_diag.h
+
+globals:
+  - { id: xat_last_frames, type: uint32_t, restore_value: no, initial_value: '0' }
+  - { id: xat_last_switches, type: uint32_t, restore_value: no, initial_value: '0' }
+  - { id: xat_last_selected, type: int, restore_value: no, initial_value: '-1' }
+  - { id: xat_select_state, type: int, restore_value: no, initial_value: '-1' }   # -1 unknown, 0 unsupported, 1 supported
+  - { id: xat_select_probe_ms, type: uint32_t, restore_value: no, initial_value: '0' }
+  - { id: xat_marker, type: std::string, restore_value: no, initial_value: '"-"' }
+
+switch:
+  - platform: template
+    id: xat_enable
+    name: "XMOS selector trace"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+
+select:
+  - platform: template
+    id: xat_mark
+    name: "XMOS test marker"
+    entity_category: config
+    optimistic: true
+    options: ["-", "Quiet", "Pos A", "Pos B", "Pos C", "Pos D", "Pos E", "Pos F", "Pos G", "Pos H",
+              "Walking", "Two talkers", "TV or music", "Device playback", "End"]
+    initial_option: "-"
+    on_value:
+      - lambda: |-
+          id(xat_marker) = x.str();
+          ESP_LOGI("xmos_mark", "MARK '%s' f=%u", id(xat_marker).c_str(), (unsigned) id(xat_last_frames));
+  - platform: template
+    id: xat_gate
+    name: "XMOS steering gate"
+    entity_category: config
+    optimistic: true
+    options: ["Output VNR (default)", "Input VNR"]
+    initial_option: "Output VNR (default)"
+
+number:
+  - { platform: template, id: xat_margin_db, name: "XMOS beam switch margin", unit_of_measurement: dB, entity_category: config, optimistic: true, restore_value: false, min_value: 0, max_value: 6, step: 0.1, initial_value: 1.5 }
+  - { platform: template, id: xat_confirm, name: "XMOS beam confirm frames", entity_category: config, optimistic: true, restore_value: false, min_value: 1, max_value: 100, step: 1, initial_value: 10 }
+  - { platform: template, id: xat_dwell, name: "XMOS beam min dwell frames", entity_category: config, optimistic: true, restore_value: false, min_value: 0, max_value: 1000, step: 1, initial_value: 34 }
+
+button:
+  - platform: template
+    name: "XMOS apply selector tuning"
+    entity_category: config
+    on_press:
+      - lambda: |-
+          auto gi = id(xat_gate).active_index();
+          const uint8_t gate = (gi.has_value() && gi.value() == 1) ? 1 : 0;
+          const int16_t margin = static_cast<int16_t>(id(xat_margin_db).state * 100.0f + 0.5f);
+          const uint16_t cf = static_cast<uint16_t>(id(xat_confirm).state);
+          const uint16_t dw = static_cast<uint16_t>(id(xat_dwell).state);
+          uint8_t p[7] = {gate,
+                          static_cast<uint8_t>(margin & 0xFF), static_cast<uint8_t>((static_cast<uint16_t>(margin) >> 8) & 0xFF),
+                          static_cast<uint8_t>(cf & 0xFF), static_cast<uint8_t>(cf >> 8),
+                          static_cast<uint8_t>(dw & 0xFF), static_cast<uint8_t>(dw >> 8)};
+          const bool ok = id(satellite1_id).transfer(XMOS_ARRAY_DIAG_RESID, XMOS_ARRAY_DIAG_CMD_SET_SELECT, p, sizeof(p));
+          ESP_LOGI("xmos_mark", "TUNING request gate=%u margin=%.2f confirm=%u dwell=%u sent=%d (check m=/cf=/dw=/gate= in the X lines)",
+                   gate, margin / 100.0f, cf, dw, ok ? 1 : 0);
+
+interval:
+  - interval: 100ms
+    then:
+      - lambda: |-
+          if (!id(xat_enable).state || id(satellite1_id).state != satellite1::SAT_XMOS_CONNECTED_STATE) {
+            return;
+          }
+          xmos_array_diag_status_t st{};
+          if (xmos_array_read(id(satellite1_id), XMOS_ARRAY_DIAG_CMD_GET_STATUS, &st) != 0 ||
+              !xmos_array_status_valid(st) || st.frames == id(xat_last_frames)) {
+            return;
+          }
+          uint32_t gap = 0;
+          if (id(xat_last_frames) != 0) {
+            if (st.frames < id(xat_last_frames)) {
+              ESP_LOGW("xmos_sel", "XMOS frame counter went back (%u -> %u): XMOS restarted",
+                       (unsigned) id(xat_last_frames), (unsigned) st.frames);
+            } else {
+              gap = (st.frames - id(xat_last_frames)) / 16 - 1;
+            }
+          }
+          id(xat_last_frames) = st.frames;
+
+          xmos_array_diag_select_t sx{};
+          bool have_sx = false;
+          const uint32_t now = millis();
+          if (id(xat_select_state) != 0 || (now - id(xat_select_probe_ms)) > 60000) {
+            const uint8_t sx_status = xmos_array_read(id(satellite1_id), XMOS_ARRAY_DIAG_CMD_GET_SELECT, &sx);
+            if (sx_status == 0 && xmos_array_select_valid(sx)) {
+              have_sx = true;
+              id(xat_select_state) = 1;
+            } else if (id(xat_select_state) != 1) {
+              if (id(xat_select_state) == -1) {
+                ESP_LOGI("xmos_sel", "XMOS has no selector diagnostics (status %u); S lines only, probing again every 60 s",
+                         sx_status);
+              }
+              id(xat_select_state) = 0;
+              id(xat_select_probe_ms) = now;
+            }
+          }
+
+          const bool beams = st.frontend_mode == 2;
+          const int n = beams ? 8 : 2;
+          const float unit = beams ? 100.0f : 10000.0f;
+          int best = st.selected < n ? st.selected : 0;
+          for (int i = 0; i < n; i++) {
+            if (st.score_cdb[i] > st.score_cdb[best]) best = i;
+          }
+          const float lead = (st.score_cdb[best] - st.score_cdb[st.selected < n ? st.selected : 0]) / unit;
+          int16_t pk = st.raw_peak_cdb[0];
+          for (int i = 1; i < 4; i++) {
+            const int16_t v = st.raw_peak_cdb[i];
+            if (v > pk) pk = v;
+          }
+          char sc[8 * 9 + 1];
+          int p = 0;
+          for (int i = 0; i < n; i++) {
+            p += snprintf(sc + p, sizeof(sc) - p, i ? ",%.2f" : "%.2f", st.score_cdb[i] / unit);
+          }
+          auto c = [](int16_t v) { return v / 100.0f; };
+          ESP_LOGI("xmos_sel",
+                   "S f=%u sel=%u sw=%u best=%d lead=%.2f vnr=%.3f ref=%u tap=%u raw=%.1f,%.1f,%.1f,%.1f "
+                   "aec=%.1f,%.1f,%.1f,%.1f out=%.1f pk=%.1f miss=%u drop=%u gap=%u mk=%s sc=%s",
+                   (unsigned) st.frames, st.selected, (unsigned) st.switch_count, best, lead, st.vnr_x10000 / 10000.0f,
+                   st.ref_active, st.tap_mode,
+                   c(st.raw_rms_cdb[0]), c(st.raw_rms_cdb[1]), c(st.raw_rms_cdb[2]), c(st.raw_rms_cdb[3]),
+                   c(st.aec_rms_cdb[0]), c(st.aec_rms_cdb[1]), c(st.aec_rms_cdb[2]), c(st.aec_rms_cdb[3]),
+                   c(st.output_rms_cdb), c(pk), (unsigned) st.deadline_misses, (unsigned) st.t1_dropped_frames_est,
+                   (unsigned) gap, id(xat_marker).c_str(), sc);
+          if (have_sx) {
+            char rs[8 * 9 + 1];
+            p = 0;
+            for (int i = 0; i < n; i++) {
+              p += snprintf(rs + p, sizeof(rs) - p, i ? ",%.2f" : "%.2f", sx.raw_score[i] / unit);
+            }
+            ESP_LOGI("xmos_sel",
+                     "X f=%u gate=%u ivnr=%.3f ovnr=%.3f val=%u/%u rl=%.2f@%u ch=%u cc=%u fss=%u m=%.2f cf=%u dw=%u rs=%s",
+                     (unsigned) sx.frames, sx.gate, sx.input_vnr_x10000 / 10000.0f, sx.output_vnr_x10000 / 10000.0f,
+                     sx.window_valid_frames, sx.window_frames, sx.raw_lead_max / unit, sx.raw_lead_max_candidate,
+                     sx.challenger, sx.confirm_count, (unsigned) sx.frames_since_switch, sx.margin / unit,
+                     sx.confirm_frames, sx.min_dwell_frames, rs);
+          }
+          if (id(xat_last_selected) >= 0 && (st.switch_count != id(xat_last_switches) || st.selected != id(xat_last_selected))) {
+            ESP_LOGI("xmos_sel", "SWITCH %d -> %u (count %u) f=%u mk=%s", id(xat_last_selected), st.selected,
+                     (unsigned) st.switch_count, (unsigned) st.frames, id(xat_marker).c_str());
+          }
+          id(xat_last_selected) = st.selected;
+          id(xat_last_switches) = st.switch_count;
